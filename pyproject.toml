@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "browser-ui-recorder"
+version = "0.1.0"
+description = "Local Chromium evidence recorder for generating Playwright tests"
+requires-python = ">=3.12"
+dependencies = ["playwright>=1.51,<2", "pydantic>=2.10,<3", "PySide6>=6.8,<7"]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<9", "pytest-asyncio>=0.25,<2"]
+
+[project.scripts]
+browser-ui-recorder = "app.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
