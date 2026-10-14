@@ -180,7 +180,11 @@ class Recorder:
 
     def body_payload(self, body, content_type):
         if len(body) > self.config.max_body_bytes:
-            return {"omitted": "size limit", "bytes": len(body)}
+            return {
+                "omitted": "size limit",
+                "bytes": len(body),
+                "limit": self.config.max_body_bytes,
+            }
         try:
             if "json" in content_type:
                 value = json.loads(body)
@@ -188,9 +192,11 @@ class Recorder:
                 value = dict(parse_qsl(body.decode("utf-8"), keep_blank_values=True))
             elif content_type.startswith("text/plain"):
                 value = body.decode("utf-8")
+            elif not content_type:
+                value = json.loads(body)  # Some JSON APIs omit Content-Type too.
             else:
                 return {"omitted": "content type"}
-            return {"data": value}
+            return {"data": value, "bytes": len(body)}
         except (ValueError, UnicodeError):
             return {"omitted": "invalid text or JSON"}
 
@@ -211,24 +217,17 @@ class Recorder:
             payload["request_headers"] = request.headers
         if self.config.max_body_bytes and request.method not in {"GET", "HEAD"}:
             headers = request.headers
-            length = headers.get("content-length", "")
-            kind = headers.get("content-type", "")
+            kind = headers.get("content-type", "").lower()
             if (
-                length.isdigit()
-                and int(length) <= self.config.max_body_bytes
-                and (
-                    "json" in kind
-                    or "x-www-form-urlencoded" in kind
-                    or kind.startswith("text/plain")
-                )
+                "json" in kind
+                or "x-www-form-urlencoded" in kind
+                or kind.startswith("text/plain")
             ):
                 body = request.post_data_buffer
                 if body is not None:
                     payload["request_body"] = self.body_payload(body, kind)
             else:
-                payload["request_body"] = {
-                    "omitted": "unknown/oversized length or content type"
-                }
+                payload["request_body"] = {"omitted": "content type"}
         try:
             frame = request.frame
         except Error:
@@ -268,21 +267,30 @@ class Recorder:
                     headers = response.headers
                     if self.config.capture_headers:
                         payload["response_headers"] = headers
-                    kind = headers.get("content-type", "")
-                    length = headers.get("content-length", "")
-                    if (
-                        self.config.max_body_bytes
-                        and length.isdigit()
-                        and int(length) <= self.config.max_body_bytes
-                        and ("json" in kind or kind.startswith("text/plain"))
+                    kind = headers.get("content-type", "").lower()
+                    if not self.config.max_body_bytes:
+                        payload["response_body"] = {"omitted": "disabled"}
+                    elif (
+                        kind
+                        and "json" not in kind
+                        and not kind.startswith("text/plain")
                     ):
+                        payload["response_body"] = {
+                            "omitted": "content type",
+                            "content_type": kind,
+                        }
+                    elif response.status in {204, 304} or request.method == "HEAD":
+                        payload["response_body"] = {
+                            "omitted": "empty response",
+                            "bytes": 0,
+                        }
+                    else:
+                        # Content-Length can be absent (HTTP/2/chunked), compressed,
+                        # or unavailable in Playwright's header view. Measure the
+                        # actual decoded body; never reject JSON by that header.
                         payload["response_body"] = self.body_payload(
                             await response.body(), kind
                         )
-                    else:
-                        payload["response_body"] = {
-                            "omitted": "unknown/oversized length or content type"
-                        }
         except (Error, TimeoutError):
             payload["response_body"] = {"omitted": "read failed or timed out"}
         self.emit_api(payload, frame, annotation)
@@ -302,18 +310,45 @@ class Recorder:
                 )
                 return
             payload = data["payload"]
+            if data["type"] != "html" or not isinstance(payload, dict):
+                raise ValueError("Invalid HTML event")
+            mode = payload.get("mode")
+            changes = payload.get("changes", [])
             if (
-                data["type"] != "html"
-                or not isinstance(payload, dict)
-                or not isinstance(payload.get("html"), str)
+                mode not in {"initial", "patch"}
+                or not isinstance(changes, list)
+                or len(changes) > self.config.max_changes_per_event
             ):
-                raise ValueError("Invalid HTML snapshot")
+                raise ValueError("Invalid HTML changes")
+            if mode == "initial" and (
+                not isinstance(payload.get("html"), str)
+                or len(payload["html"]) > self.config.max_html_chars
+            ):
+                raise ValueError("Oversized initial HTML")
+            if mode == "patch" and "html" in payload:
+                raise ValueError("Patches must not contain a full snapshot")
+            for change in changes:
+                if not isinstance(change, dict) or change.get("op") not in {
+                    "add",
+                    "context",
+                    "remove",
+                    "text",
+                    "set_text",
+                    "attribute",
+                    "value",
+                    "location",
+                }:
+                    raise ValueError("Invalid patch")
+                if "html" in change and (
+                    not isinstance(change["html"], str)
+                    or len(change["html"]) > self.config.max_html_chars
+                ):
+                    raise ValueError("Oversized HTML fragment")
             if (
-                len(payload["html"]) > self.config.max_html_chars
-                or not isinstance(payload.get("actions", []), list)
+                not isinstance(payload.get("actions", []), list)
                 or len(payload.get("actions", [])) > 20
             ):
-                raise ValueError("Oversized snapshot")
+                raise ValueError("Oversized action batch")
             frame = source["frame"]
             payload["parent_frame_id"] = (
                 self.frame_id(frame.parent_frame) if frame.parent_frame else None

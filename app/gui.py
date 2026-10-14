@@ -166,7 +166,7 @@ class ControlWindow(QMainWindow):
         )
         if store:
             self.counters.setText(
-                f"{store.counts['html']} HTML states · {store.counts['api']} APIs · "
+                f"{store.counts['html']} HTML events · {store.counts['api']} APIs · "
                 f"{store.dropped_events + store.dropped_apis} dropped at capacity"
             )
             self.output.setText(str(store.path))

@@ -38,7 +38,7 @@ class SessionStore:
         self._lock = asyncio.Lock()
         self._written = 0
         self.header = {
-            "schema_version": 2,
+            "schema_version": 3,
             "session_id": self.id,
             "started_at": datetime.now(UTC).isoformat(),
             "browser": {
@@ -47,7 +47,7 @@ class SessionStore:
                 "mobile_emulation": config.device is not None,
             },
             "config": self.redactor.clean(config.model_dump()),
-            "guidance": "Ordered HTML states with associated actions and allowlisted API results. HTML is sanitized and bounded; inspect truncated flags and dropped counters. Use semantic locators from actions and HTML. Device mode emulates Chromium, not Safari or a real phone.",
+            "guidance": "One minified HTML baseline per document, then ordered add/remove/text/attribute/value patches with associated actions and allowlisted API results. Loading states may be transient. Export-only node IDs are not application locators. See AGENT_GUIDE.md. Inspect truncation, coalescing, and dropped counters. Device mode emulates Chromium, not Safari or a real phone.",
         }
         prefix = (
             json.dumps(self.header, ensure_ascii=False).encode()[:-1] + b",\n" + MARKER
@@ -154,7 +154,7 @@ def repair_recording(path: Path):
     """Recover complete events if a crash interrupted an in-place batch write."""
     data = path.read_bytes()
     if MARKER not in data:
-        raise ValueError("Not a version 2 recording")
+        raise ValueError("Not a supported recording")
     head, tail = data.split(MARKER, 1)
     header = json.loads(head.rstrip().removesuffix(b",") + b"}")
     decoder = json.JSONDecoder()

@@ -1,3 +1,4 @@
+import gzip
 import json
 import os
 import shutil
@@ -40,6 +41,8 @@ def chromium_path():
 @pytest.fixture
 def demo_server():
     class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
         def log_message(self, *args):
             pass
 
@@ -64,6 +67,32 @@ def demo_server():
                 )
             elif self.path == "/popup":
                 self.respond("<h1>Receipt</h1>")
+            elif self.path in {"/api/chunked", "/api/no-type"}:
+                data = json.dumps(
+                    {"result": "Chunked ready", "token": "CHUNK_SECRET"}
+                ).encode()
+                self.send_response(200)
+                if self.path != "/api/no-type":
+                    self.send_header("Content-Type", "application/json")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                for part in (data[:10], data[10:]):
+                    self.wfile.write(f"{len(part):x}\r\n".encode() + part + b"\r\n")
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            elif self.path in {"/api/gzip", "/api/gzip-large"}:
+                body = {
+                    "result": "Compressed ready"
+                    if self.path == "/api/gzip"
+                    else "X" * 10000
+                }
+                data = gzip.compress(json.dumps(body).encode())
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Encoding", "gzip")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
             elif self.path == "/api/large":
                 self.respond(
                     json.dumps(

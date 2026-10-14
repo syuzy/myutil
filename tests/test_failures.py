@@ -18,7 +18,9 @@ async def test_body_failure_and_unknown_size(tmp_path):
         body=AsyncMock(side_effect=Error("secret text must not be logged")),
     )
     request = SimpleNamespace(
-        response=AsyncMock(return_value=response), timing={"responseEnd": 12}
+        response=AsyncMock(return_value=response),
+        timing={"responseEnd": 12},
+        method="GET",
     )
     await recorder.capture_api(
         request, ({"url": "https://example.com/api"}, None, "original-annotation")
@@ -27,7 +29,7 @@ async def test_body_failure_and_unknown_size(tmp_path):
     await recorder.capture_api(
         request, ({"url": "https://example.com/api"}, None, None)
     )
-    assert response.body.await_count == 1
+    assert response.body.await_count == 2
     recorder.on_sensor({}, {"type": "unexpected"})
     await recorder.stop()
     data = json.loads(recorder.store.path.read_text())

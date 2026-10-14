@@ -69,9 +69,9 @@ async def test_payment_one_file_allowlist_and_redaction(
     assert data["annotations"][0]["id"] == case.id
     assert data["annotations"][0]["end_seq"]
     snapshots = [e for e in data["events"] if e["type"] == "html"]
-    assert any("Payment accepted" in e["payload"]["html"] for e in snapshots)
+    assert any("Payment accepted" in json.dumps(e["payload"]) for e in snapshots)
     assert any(
-        "Selected" in e["payload"]["html"] and e["payload"]["parent_frame_id"]
+        "Selected" in json.dumps(e["payload"]) and e["payload"]["parent_frame_id"]
         for e in snapshots
     )
     assert any(
@@ -124,6 +124,7 @@ async def test_noise_and_mutation_storm_are_bounded(
             debounce_ms=100,
             max_wait_ms=600,
             ignore_selectors=["#ticker"],
+            watched_attributes=["hidden", "disabled", "aria-expanded"],
             dom_budget_ms=50,
         ),
     )
@@ -161,7 +162,7 @@ async def test_noise_and_mutation_storm_are_bounded(
         })""")
         assert ticks == 100 and time.monotonic() - start < 8
         await recorder.checkpoint()
-        assert 1 <= recorder.store.counts["html"] - baseline <= 6
+        assert 1 <= recorder.store.counts["html"] - baseline <= 30
         count = recorder.store.counts["html"]
         await recorder.checkpoint()
         assert (
@@ -170,7 +171,7 @@ async def test_noise_and_mutation_storm_are_bounded(
     finally:
         await recorder.stop()
     result = json.loads(recorder.store.path.read_text())
-    assert len(result["events"]) < 20
+    assert len(result["events"]) < 40
     assert recorder.store.path.stat().st_size < 80_000
 
 
@@ -200,10 +201,16 @@ async def test_large_dom_budget_root_scope_and_mobile(
         await recorder.stop()
     result = json.loads(recorder.store.path.read_text())
     snapshots = [e["payload"] for e in result["events"] if e["type"] == "html"]
-    assert snapshots[-1]["truncated"]
-    assert len(snapshots[-1]["html"]) <= 2000
-    assert snapshots[-1]["nodes"] <= 81
-    assert "Checkout" not in snapshots[-1]["html"]
+    additions = [
+        op for snapshot in snapshots for op in snapshot["changes"] if op["op"] == "add"
+    ]
+    assert additions
+    assert any(op["truncated"] for op in additions) or any(
+        s.get("dropped_changes") for s in snapshots
+    )
+    assert all(len(op["html"]) <= 2000 for op in additions)
+    assert all("Checkout" not in op["html"] for op in additions)
+    assert len([s for s in snapshots if s["mode"] == "initial"]) == 1
     assert result["browser"]["device"] == "Pixel 7"
     assert result["browser"]["mobile_emulation"]
 
@@ -301,7 +308,7 @@ async def test_deferred_root_and_no_action_mode(tmp_path, demo_server, chromium_
         for e in json.loads(recorder.store.path.read_text())["events"]
         if e["type"] == "html"
     ]
-    assert "Current value" in snapshots[-1]["html"]
+    assert "Current value" in json.dumps(snapshots[-1])
     assert all(not s["actions"] for s in snapshots)
 
 

@@ -38,8 +38,8 @@ On Linux, use the same uv commands. If Chromium needs system libraries, run `uv 
 | Terminal command | Effect |
 | --- | --- |
 | `annotate NAME` | Start an annotation covering all captured pages. End the current annotation first. |
-| `end` | Flush changed HTML, then end the annotation. |
-| `checkpoint` | Capture current HTML if it changed and flush pending records. It does not duplicate unchanged HTML. |
+| `end` | Flush copied DOM changes, then end the annotation. |
+| `checkpoint` | Drain observed DOM changes and flush pending records. It does not redump the page. |
 | `status` | Print counts of captured HTML states, APIs, and other session events. |
 | `stop` / `quit` / `exit` | Finalize the JSON and close the recorder's Chromium instance. |
 
@@ -61,7 +61,7 @@ Only `fetch`/XHR calls matching both the URL allowlist and `api_methods` are eli
 
 This is passive observation, not a proxy or Playwright route interceptor: it does not modify, block, or replay website traffic and does not disable browser caching. The allowlist controls **recording**, not browser Internet access.
 
-JSON, URL-encoded request bodies, and plain text are included only within `max_body_bytes`. Responses must be JSON/plain text with a known acceptable Content-Length. Unknown/chunked, binary, large, or unreadable bodies have an explicit omission reason. No body is written to another file. Playwright buffers a selected body before the second size check; a compressed response can expand beyond its advertised length. Set `max_body_bytes: 0` for status/timing only.
+JSON, URL-encoded request bodies, and plain text are included only within `max_body_bytes`. JSON/plain-text responses are read even when Content-Length is missing, chunked, or compressed. When Content-Type is missing, the body must parse as JSON. The limit applies to **actual decoded bytes before redaction**, not the header or compressed transfer size. Included bodies have `data` and `bytes`; a real size violation has `omitted: "size limit"`, `bytes`, and `limit`. Disabled capture, unsupported types, empty responses, parse failures, and read failures have distinct reasons. No body is written to another file. Playwright buffers a completed selected body before the size check; recording size, concurrency, and read time are bounded, but this is not a streaming memory limit. Set `max_body_bytes: 0` for status/timing only.
 
 ## 4. Mobile browsing
 
@@ -104,31 +104,37 @@ Defaults intentionally capture less. Unknown settings are rejected to catch typo
 
 ### HTML and performance settings
 
+DOM changes are copied **when the MutationObserver callback runs**, including nodes already removed by the time the callback arrives. Text/attribute old values recover same-task transitions. Transport batching does not delay serialization or discard an add followed by a remove.
+
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `root_selector` | `"body"` | Capture only this CSS-selected subtree. Prefer your checkout/form container on a huge site. Only the first match is used; a missing root waits until it appears. |
+| `root_selector` | `"body"` | Capture the first matching subtree. Prefer your checkout/form container on a huge site. A missing root waits until it appears. |
 | `ignore_selectors` | `[]` | Exclude tickers, ads, clocks, or other noisy subtrees. Scripts/styles/SVG/canvas/templates/metadata are always omitted. |
-| `debounce_ms` | `400` | Wait briefly for related changes to settle. |
-| `min_snapshot_interval_ms` | `1500` | Minimum spacing between automatic snapshots per document/frame. |
-| `max_wait_ms` | `3000` | Flush sustained change bursts without waiting forever for quiet. Must be at least both intervals above. |
-| `max_html_chars` | `80000` | Maximum characters in each sanitized HTML snapshot (500–500000). |
-| `max_dom_nodes` | `3000` | Maximum nodes visited per snapshot (20–20000). |
-| `dom_budget_ms` | `12` | Traversal time budget (2–100 ms). A single DOM operation can exceed the budget; this is a best-effort bound, not a hard browser scheduling guarantee. |
-| `watched_attributes` | See below | Attribute changes that schedule a snapshot. Child/text changes are always observed. |
-| `capture_frames` | `false` | Opt into iframe HTML capture. This adds a sensor and per-frame budget to each frame, including third-party frames. |
-| `record_actions` | `true` | Attach bounded click/input/change/submit context to the next changed snapshot. Inputs are coalesced; no standalone keystroke stream. |
+| `dom_flush_interval_ms` | `50` | Transport copied changes in short batches (10–1000 ms). This does not postpone capture. |
+| `max_changes_per_event` | `200` | Maximum delta operations in one event (10–1000). |
+| `max_pending_changes` | `1000` | Maximum queued browser-side operations (50–5000); a separate character cap bounds the queue too. |
+| `max_mutation_records` | `5000` | Maximum source records inspected per observer callback (100–50000). |
+| `max_transition_history` | `16` | Retain this many intermediate text/attribute/value states before retaining only the latest one (2–100). Additional omitted transitions are counted by `coalesced`. |
+| `max_html_chars` | `80000` | Maximum initial HTML/individual fragment characters and per-callback added HTML budget (500–500000). Scalar patch values are capped at 4000 characters and flagged if truncated. |
+| `max_dom_nodes` | `3000` | Maximum nodes visited for an initial baseline or additions in one callback (20–20000). |
+| `dom_budget_ms` | `12` | Traversal/callback time budget (2–100 ms). A single DOM operation can exceed it; this is a best-effort bound. |
+| `watched_attributes` | See below | Attributes whose changes create deltas. Child/text changes are always observed. |
+| `capture_frames` | `false` | Opt into iframe HTML capture. Each frame has its own sensor, IDs, and budget. |
+| `record_actions` | `true` | Attach bounded click/input/change/submit context to the next delta batch. Input properties are observed even when action metadata is disabled. |
 | `record_errors` | `false` | Opt into uncaught page errors. Console and WebSocket telemetry remain disabled. |
 
 Default watched attributes:
 
 ```json
-["hidden", "open", "disabled", "checked", "selected", "value", "href",
+["class", "style", "hidden", "open", "disabled", "checked", "selected", "value", "href",
  "aria-hidden", "aria-expanded", "aria-checked", "aria-selected", "aria-disabled"]
 ```
 
-Style/class animation is ignored by default. If your UI relies on class-only state changes, add `"class"` to `watched_attributes`; if necessary add `"style"` too. The configured attributes are also included in the sanitized HTML. This trades additional capture work for evidence of visual state. Pure CSS hover/animation, layout, scroll, images, canvas, and closed shadow DOM are not captured. URL changes can produce a snapshot even when the sanitized HTML is identical, so navigation context is preserved.
+Class changes capture class-based loading/visibility states. Style is reduced to `display`, `visibility`, and `content-visibility`; animated transforms, positions, opacity, and other geometry are ignored. Exclude animation-only subtrees with `ignore_selectors`, or remove `class` from `watched_attributes` if appropriate for your application. Pure CSS hover/animation without watched DOM changes, layout, scroll, images, canvas, and closed shadow DOM are not captured.
 
-Actions accompany changed HTML/form state, not every click. A click with no observed state change creates no record by itself. At most 20 actions are held between snapshots; excess actions are counted in `dropped_actions`. Full-page navigation can destroy an action buffer before it reaches Python; the before/after HTML and URLs remain the primary evidence. Snapshot `truncated: true` means a size/node/depth/time limit was reached; do not infer that omitted page content was absent. Large or busy pages benefit most from a narrower `root_selector`. Portals/modals outside that root will be excluded.
+The legacy `debounce_ms`, `min_snapshot_interval_ms`, and `max_wait_ms` settings remain accepted for existing config files but **no longer delay or control DOM capture**. Use `dom_flush_interval_ms` for transport frequency. Checkpoints and annotation/session end drain pending changes instead of serializing the entire page again.
+
+At most 20 user actions accompany a batch; overflow is counted in `dropped_actions`. Full-page navigation can destroy a buffer before delivery. `truncated`, `dropped_changes`, or `coalesced` indicate incomplete detail. Do not infer omitted content was absent. Later edits below a truncated baseline can include local `context` fragments, which identify existing nodes without redumping the root. Portals/modals outside the configured root are excluded.
 
 ### API, storage, redaction, and browser settings
 
@@ -189,36 +195,29 @@ System browser versions can differ from Playwright's tested build. Prefer the in
 
 ## 7. Read the single JSON file
 
-The document is shaped like:
+Version **3** stores one minified baseline per document/root instance and subsequent deltas. Metadata, annotations, actions, device settings, and allowlisted API bodies remain in the same file. There is no separate export step.
 
 ```json
 {
-  "schema_version": 2,
-  "session_id": "...",
-  "started_at": "...",
-  "browser": {"engine": "chromium", "device": "Pixel 7", "mobile_emulation": true},
-  "config": {},
-  "guidance": "...",
+  "schema_version": 3,
   "events": [
-    {
-      "seq": 4, "timestamp": "...", "elapsed_ms": 1200,
-      "session_id": "...", "page_id": "page-1", "frame_id": "frame-1",
-      "annotation_id": "...", "source": "dom", "type": "html",
-      "payload": {"url": "https://example.com/checkout", "title": "Checkout",
-                  "html": "<main>...</main>", "actions": [], "truncated": false}
-    }
-  ],
-  "status": "complete",
-  "annotations": [],
-  "counts": {},
-  "dropped_events": 0,
-  "dropped_apis": 0
+    {"type": "html", "payload": {
+      "mode": "initial", "document_id": "doc-a", "root_id": "n1",
+      "html": "<main data-recorder-node=\"n1\"></main>", "changes": []
+    }},
+    {"type": "html", "payload": {
+      "mode": "patch", "document_id": "doc-a", "changes": [
+        {"op": "add", "node_id": "n2", "parent_id": "n1", "html": "<div data-recorder-node=\"n2\">Loading</div>"},
+        {"op": "remove", "node_id": "n2", "parent_id": "n1"}
+      ]
+    }}
+  ]
 }
 ```
 
-HTML is stored directly, not as external file references. Actions contain semantic locator data. API results contain their eligible bodies directly. Annotation spans use event sequence numbers. A frame ID identifies a Playwright frame and persists across its navigations; `parent_frame_id` identifies nested frames when enabled. `seq` is observation order, not causal network order; selected API events include their request start time and original annotation.
+The abbreviated example omits event timestamps, IDs, config, annotation metadata, counts, and completion status. Each real event retains those shared fields. Only an `initial` event has top-level HTML; a `patch` contains only changes. A replaced root establishes a new baseline. Export-only element IDs and text markers (`<!--r:n3-->`) identify delta targets; they do not exist in the real browser DOM.
 
-For generation, tell the LLM to read the header/device settings, use the last HTML state before an annotation as its initial state, then follow that annotation's ordered HTML/actions/API events. The last HTML state for each page/frame is the final observed state. Ask for semantic role/label/test-ID locators, verify locator uniqueness, and replace `[REDACTED]` with test fixtures. No extra export command is needed.
+Read **[AGENT_GUIDE.md](AGENT_GUIDE.md)** for a short, framework- and language-agnostic explanation of each operation and how to infer automation tests. It covers transient loading states, intermediate histories, semantic locators, API correlation, and completeness flags.
 
 ## 8. Performance tuning and recovery
 
@@ -229,14 +228,14 @@ For a busy checkout:
   "root_selector": "#checkout",
   "ignore_selectors": [".live-chat", ".ticker", "[data-ad-slot]"],
   "api_allowlist": ["https://shop.example.com/api/checkout*"],
-  "min_snapshot_interval_ms": 2000,
-  "max_wait_ms": 4000,
+  "dom_flush_interval_ms": 100,
+  "max_transition_history": 16,
   "max_html_chars": 40000,
   "capture_frames": false
 }
 ```
 
-Check `truncated`, `dropped_events`, `dropped_apis`, and snapshot `dropped_actions` before trusting completeness. Scope capture before increasing limits. The test suite exercises 20,000 DOM mutations, ignored animation/scroll events, and capped concurrent APIs; those are regression checks, not a guarantee for every production site.
+Check `truncated`, `dropped_events`, `dropped_apis`, and HTML batch `dropped_changes`/`dropped_actions` before trusting completeness. Scope capture before increasing limits. The test suite exercises 20,000 DOM mutations, ignored animation/scroll events, and capped concurrent APIs; those are regression checks, not a guarantee for every production site.
 
 The JSON is valid after each completed batch flush. To avoid repeatedly rewriting a growing file, the writer appends events in place and rewrites only the small trailing metadata section. A reader can see an incomplete tail during a write; read after a flush or after stopping. A crash can lose buffered events or interrupt the tail. Recover complete records without changing the original:
 
@@ -248,4 +247,8 @@ This creates `session-abc.recovered.json` with `status: "recovered"`. It cannot 
 
 ## Migration from 0.1
 
-Version 0.2 deliberately removes rrweb, artifact directories, JSONL, the derived export, and unconditional network/console/WebSocket recording. Existing v1 folders are left untouched; the v2 repair command is not a v1 converter. `--export` and `inline_body_bytes` no longer exist. The launcher defaults to terminal controls; add `--gui` and install the `gui` extra for the window. Mobile and API configuration are new. All new sessions use the single-file v2 format.
+Version 0.2 deliberately removes rrweb, artifact directories, JSONL, the derived export, and unconditional network/console/WebSocket recording. Existing v1 folders are left untouched; the repair command is not a v1 converter. `--export` and `inline_body_bytes` no longer exist. The launcher defaults to terminal controls; add `--gui` and install the `gui` extra for the window. Mobile and API configuration are new. All new sessions use the single-file v2 format.
+
+## Migration from 0.2
+
+Version 0.3 changes `schema_version` to 3. HTML now has `mode`, `document_id`, and `changes`; only initial baselines contain top-level `html`. Consumers must understand deltas using AGENT_GUIDE.md. Legacy snapshot timing parameters remain accepted but have no capture effect. New defaults watch class and visibility-related style changes. API bodies no longer require Content-Length; limits use actual decoded bytes. The repair command handles both v2 and v3 single-file recordings.

@@ -16,6 +16,12 @@ class Config(BaseModel):
     ignore_selectors: list[str] = Field(default_factory=list)
     redact_selectors: list[str] = Field(default_factory=list)
     extra_headers: list[str] = Field(default_factory=list)
+    dom_flush_interval_ms: int = Field(default=50, ge=10, le=1000)
+    max_changes_per_event: int = Field(default=200, ge=10, le=1000)
+    max_pending_changes: int = Field(default=1000, ge=50, le=5000)
+    max_mutation_records: int = Field(default=5000, ge=100, le=50_000)
+    max_transition_history: int = Field(default=16, ge=2, le=100)
+    # Retained for old configuration files; DOM capture no longer waits on these.
     debounce_ms: int = Field(default=400, ge=50, le=10_000)
     min_snapshot_interval_ms: int = Field(default=1500, ge=100, le=30_000)
     max_wait_ms: int = Field(default=3000, ge=100, le=60_000)
@@ -24,6 +30,8 @@ class Config(BaseModel):
     dom_budget_ms: int = Field(default=12, ge=2, le=100)
     watched_attributes: list[str] = Field(
         default_factory=lambda: [
+            "class",
+            "style",
             "hidden",
             "open",
             "disabled",

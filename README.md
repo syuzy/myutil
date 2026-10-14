@@ -18,9 +18,9 @@ uv run browser-ui-recorder --mobile --url https://shop.example.com \
 
 Commands: `annotate Payment Case`, `end`, `checkpoint`, `status`, `stop`.
 
-Each session produces `sessions/session-<id>.json` containing HTML states, associated semantic actions, annotations, URLs, device settings, and allowlisted API results. No separate artifacts or export step.
+Each session produces `sessions/session-<id>.json` containing a minified HTML baseline and added/deleted/modified fragments, associated semantic actions, annotations, URLs, device settings, and allowlisted API results. No separate artifacts or export step.
 
-- A small MutationObserver batches HTML changes. Default minimum interval: **1.5 seconds**; unchanged snapshots are discarded.
+- A small MutationObserver copies DOM changes immediately, preserving rapid overlays/skeletons. Only the initial root is serialized in full; later events contain deltas, transported in short batches.
 - No rrweb, mousemove/scroll telemetry, console stream, WebSocket stream, or per-resource logs.
 - No APIs are captured unless explicitly allowlisted. Traffic is observed without rerouting or blocking it.
 - HTML traversal, payload sizes, pending API reads, event buffers, and writes are bounded. HTML truncation and dropped-event counters are explicit.
@@ -33,6 +33,8 @@ uv sync --locked --extra gui
 uv run browser-ui-recorder --gui
 ```
 
+For framework-agnostic test generation, read **[AGENT_GUIDE.md](AGENT_GUIDE.md)**.
+
 Read **[USAGE.md](USAGE.md)** for the macOS tutorial, all settings and environment variables, mobile profiles, performance tuning, JSON format, and recovery.
 
 Development:
@@ -43,4 +45,4 @@ uv run playwright install chromium
 uv run pytest -q
 ```
 
-Tests cover a payment flow, API filters, redaction, mobile emulation, mutation storms, large DOM budgets, single-file persistence/recovery, terminal controls, and the optional Qt window. GitHub Actions runs the suite on macOS and Linux. Local validation in this development environment uses Linux Chromium; macOS execution is covered by the CI job when it runs.
+Tests cover transient overlays, minified DOM deltas, chunked/compressed JSON, a payment flow, API filters, redaction, mobile emulation, mutation storms, large DOM budgets, single-file persistence/recovery, terminal controls, and the optional Qt window. GitHub Actions runs the suite on macOS and Linux. Local validation in this development environment uses Linux Chromium; macOS execution is covered by the CI job when it runs.
