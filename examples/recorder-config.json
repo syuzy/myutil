@@ -1,0 +1,18 @@
+{
+  "root_selector": "body",
+  "api_allowlist": ["https://your-site.example/api/orders/*"],
+  "api_methods": ["GET", "POST"],
+  "device": null,
+  "ignore_selectors": [".live-chat", ".ticker"],
+  "redact_selectors": [".customer-secret", "#private-note"],
+  "extra_headers": ["X-Internal-Key"],
+  "debounce_ms": 400,
+  "min_snapshot_interval_ms": 1500,
+  "max_wait_ms": 3000,
+  "max_html_chars": 80000,
+  "max_dom_nodes": 3000,
+  "max_body_bytes": 16384,
+  "capture_frames": false,
+  "capture_headers": false,
+  "record_errors": false
+}

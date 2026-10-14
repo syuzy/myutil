@@ -1,7 +1,7 @@
 import re
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from pydantic import BaseModel, Field
+from .config import Config
 
 REDACTED = "[REDACTED]"
 SECRET_KEY = re.compile(
@@ -9,20 +9,13 @@ SECRET_KEY = re.compile(
     r"credit[-_]?card|card[-_]?(number|no)|(?:^|[-_])(cvv|cvc|pan)(?:$|[-_])",
     re.IGNORECASE,
 )
-CARD = re.compile(r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)")
+CARD = re.compile(r"(?<![A-Za-z0-9])(?:\d[ -]?){13,19}(?![A-Za-z0-9])")
 ASSIGNMENT = re.compile(
     r"""(?i)((?:password|passwd|authorization|access[_-]?token|refresh[_-]?token|api[_-]?key|secret|session[_-]?id|cvv|cvc)["']?\s*[:=]\s*["']?)([^\s&;,"'<>}]+)"""
 )
 BEARER = re.compile(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+")
 JWT = re.compile(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b")
 BASE64 = re.compile(r"(?<![\w/])[A-Za-z0-9+/]{120,}={0,2}(?!\w)")
-
-
-class Config(BaseModel):
-    extra_headers: list[str] = Field(default_factory=list)
-    redact_selectors: list[str] = Field(default_factory=list)
-    inline_body_bytes: int = Field(default=4096, ge=0, le=65536)
-    max_body_bytes: int = Field(default=1_000_000, ge=0, le=10_000_000)
 
 
 class Redactor:

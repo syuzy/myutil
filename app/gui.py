@@ -2,6 +2,7 @@ import asyncio
 
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
+    QComboBox,
     QFormLayout,
     QHBoxLayout,
     QLabel,
@@ -36,6 +37,15 @@ class ControlWindow(QMainWindow):
         layout.addWidget(self.status)
         form = QFormLayout()
         self.url = QLineEdit(url)
+        self.device = QComboBox()
+        self.device.addItems(["Desktop", "Pixel 7", "iPhone 13"])
+        if recorder.config.device and self.device.findText(recorder.config.device) < 0:
+            self.device.addItem(recorder.config.device)
+        self.device.setCurrentText(recorder.config.device or "Desktop")
+        self.apis = QLineEdit(", ".join(recorder.config.api_allowlist))
+        self.apis.setPlaceholderText("No APIs captured; e.g. https://app.example/api/*")
+        form.addRow("Device", self.device)
+        form.addRow("API allowlist", self.apis)
         self.name = QLineEdit()
         self.name.setPlaceholderText("Payment Case")
         self.goal = QLineEdit()
@@ -104,6 +114,18 @@ class ControlWindow(QMainWindow):
         task.add_done_callback(self.tasks.discard)
 
     async def start_session(self):
+        from .config import Config
+
+        settings = self.recorder.config.model_dump()
+        settings["device"] = (
+            None
+            if self.device.currentText() == "Desktop"
+            else self.device.currentText()
+        )
+        settings["api_allowlist"] = [
+            p.strip() for p in self.apis.text().split(",") if p.strip()
+        ]
+        self.recorder.config = Config.model_validate(settings)
         await self.recorder.start(
             self.url.text().strip() or "about:blank",
             headless=self.headless,
@@ -113,7 +135,7 @@ class ControlWindow(QMainWindow):
 
     async def stop_session(self):
         await self.recorder.stop()
-        self.status.setText("Session saved — compact LLM context exported")
+        self.status.setText("Session saved — one JSON file")
 
     async def begin_annotation(self):
         self.recorder.start_annotation(
@@ -135,21 +157,21 @@ class ControlWindow(QMainWindow):
         self.end.setEnabled(recording and annotated and not self.busy)
         self.checkpoint.setEnabled(recording and not self.busy)
         self.url.setEnabled(not recording and not self.busy)
+        self.device.setEnabled(not recording and not self.busy)
+        self.apis.setEnabled(not recording and not self.busy)
         self.active.setText(
             "Active: " + self.recorder.annotations[-1].name
             if annotated
             else "No active annotation"
         )
         if store:
-            actions = sum(v for k, v in store.counts.items() if k.startswith("action."))
             self.counters.setText(
-                f"{store.seq} events · {actions} actions · {store.counts['network.request']} requests · {store.counts['dom']} DOM events"
+                f"{store.counts['html']} HTML states · {store.counts['api']} APIs · "
+                f"{store.dropped_events + store.dropped_apis} dropped at capacity"
             )
             self.output.setText(str(store.path))
             if store.closed and self.status.text().startswith("Recording"):
-                self.status.setText(
-                    "Browser closed — session saved and context exported"
-                )
+                self.status.setText("Browser closed — JSON recording saved")
 
     def closeEvent(self, event):
         if self.allow_close:

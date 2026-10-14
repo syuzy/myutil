@@ -4,51 +4,59 @@ from unittest.mock import AsyncMock
 
 from playwright.async_api import Error
 
+from app.config import Config
 from app.recorder import Recorder
-from app.redaction import Config
 from app.storage import SessionStore
 
 
-async def test_body_failure_and_unknown_size_do_not_stop_recording(tmp_path):
+async def test_body_failure_and_unknown_size(tmp_path):
     recorder = Recorder(tmp_path)
     recorder.store = SessionStore(tmp_path, Config())
-    recorder.request_context = lambda request: {}
     response = SimpleNamespace(
+        status=200,
         headers={"content-type": "application/json", "content-length": "20"},
-        body=AsyncMock(side_effect=Error("secret content must not be logged")),
+        body=AsyncMock(side_effect=Error("secret text must not be logged")),
     )
     request = SimpleNamespace(
-        resource_type="fetch", response=AsyncMock(return_value=response)
+        response=AsyncMock(return_value=response), timing={"responseEnd": 12}
     )
-    recorder.request_id = lambda request: "request-1"
-    await recorder.capture_body(request)
-    assert recorder.recording
-    event = json.loads(
-        (recorder.store.path / "events.jsonl").read_text().splitlines()[-1]
+    await recorder.capture_api(
+        request, ({"url": "https://example.com/api"}, None, "original-annotation")
     )
-    assert event["payload"]["body_omitted"] == "read failed"
     response.headers.pop("content-length")
-    await recorder.capture_body(request)
-    assert response.body.await_count == 1
-    recorder.on_sensor({}, {"type": "unexpected", "payload": {}})
-    recorder.on_sensor({}, {"type": "dom", "payload": {"data": None}})
-    assert recorder.store.counts["recorder.warning"] == 2
-    await recorder.stop()
-    assert recorder.store.closed
-
-
-async def test_browser_disconnect_finalizes(tmp_path, demo_server, chromium_path):
-    import asyncio
-
-    recorder = Recorder(tmp_path)
-    await recorder.start(demo_server, headless=True, executable_path=chromium_path)
-    recorder.start_annotation("Disconnect")
-    await recorder.browser.close()
-    async with asyncio.timeout(10):
-        while not recorder.store.closed or recorder.stopping:
-            await asyncio.sleep(0.02)
-    assert (
-        json.loads((recorder.store.path / "manifest.json").read_text())["status"]
-        == "complete"
+    await recorder.capture_api(
+        request, ({"url": "https://example.com/api"}, None, None)
     )
-    assert (recorder.store.path / "derived/llm-context.json").exists()
+    assert response.body.await_count == 1
+    recorder.on_sensor({}, {"type": "unexpected"})
+    await recorder.stop()
+    data = json.loads(recorder.store.path.read_text())
+    api = [e for e in data["events"] if e["type"] == "api"]
+    assert api[0]["annotation_id"] == "original-annotation"
+    assert api[0]["payload"]["response_body"]["omitted"] == "read failed or timed out"
+    assert "secret text" not in recorder.store.path.read_text()
+
+
+def test_allowlist_matches_only_api_path_and_method():
+    recorder = Recorder(
+        config=Config(
+            api_allowlist=["https://example.com/api/orders/*"], api_methods=["post"]
+        )
+    )
+
+    def request(url, resource_type="fetch", method="POST"):
+        return SimpleNamespace(url=url, resource_type=resource_type, method=method)
+
+    assert recorder.matches_api(
+        request("https://example.com/api/orders/1?token=secret")
+    )
+    assert not recorder.matches_api(
+        request("https://analytics.example.com/api/orders/1")
+    )
+    assert not recorder.matches_api(
+        request("https://example.com/api/orders/1", method="GET")
+    )
+    assert not recorder.matches_api(
+        request("https://example.com/api/orders/1", resource_type="image")
+    )
+    assert not recorder.matches_api(request("https://example.com/analytics"))

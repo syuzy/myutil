@@ -1,74 +1,41 @@
 import asyncio
 import json
 import logging
+import time
+from fnmatch import fnmatchcase
 from pathlib import Path
-from urllib.parse import parse_qsl
+from urllib.parse import parse_qsl, urlsplit, urlunsplit
 from uuid import uuid4
 
 from playwright.async_api import Error
+from playwright.async_api import TimeoutError as PlaywrightTimeout
 
 from . import browser as browser_tools
-from .events import ActionPayload, Annotation
-from .redaction import Config
+from .config import Config
+from .events import Annotation
 from .storage import SessionStore
 
 log = logging.getLogger(__name__)
 
 
 class Recorder:
-    def __init__(self, output: Path = Path("sessions"), config: Config | None = None):
+    def __init__(self, output=Path("sessions"), config=None):
         self.output = Path(output)
         self.config = config or Config()
         self.store = None
         self.playwright = self.browser = self.context = None
+        self.pages, self.frames, self.requests = {}, {}, {}
         self.annotations = []
-        self.pages = {}
-        self.frames = {}
-        self.requests = {}
         self.tasks = set()
         self.finalizing_tasks = set()
+        self.autosave = None
         self.stopping = False
+        self.starting = False
         self._stop_lock = asyncio.Lock()
 
     @property
     def recording(self):
         return self.store is not None and not self.store.closed and not self.stopping
-
-    def spawn(self, coroutine):
-        task = asyncio.create_task(coroutine)
-        self.tasks.add(task)
-
-        def done(task):
-            self.tasks.discard(task)
-            if not task.cancelled() and task.exception():
-                # Never log exception text: external page data can contain secrets.
-                self.emit(
-                    "recorder.warning",
-                    {
-                        "operation": "optional telemetry",
-                        "error": type(task.exception()).__name__,
-                    },
-                    source="recorder",
-                )
-                log.warning(
-                    "Optional telemetry failed (%s)", type(task.exception()).__name__
-                )
-
-        task.add_done_callback(done)
-        return task
-
-    def schedule_stop(self, reason):
-        task = asyncio.create_task(self.stop(reason))
-        self.finalizing_tasks.add(task)
-
-        def done(task):
-            self.finalizing_tasks.discard(task)
-            if not task.cancelled() and task.exception():
-                log.error(
-                    "Session finalization failed (%s)", type(task.exception()).__name__
-                )
-
-        task.add_done_callback(done)
 
     def page_id(self, page):
         if page not in self.pages:
@@ -80,300 +47,296 @@ class Recorder:
             self.frames[frame] = f"frame-{len(self.frames) + 1}"
         return self.frames[frame]
 
-    def emit(self, type, payload, *, page=None, frame=None, source="playwright"):
+    def emit(
+        self, type, payload, *, page=None, frame=None, source="recorder", **kwargs
+    ):
         if self.store and not self.store.closed:
             return self.store.emit(
                 type,
                 payload,
-                source=source,
                 page_id=self.page_id(page) if page else None,
                 frame_id=self.frame_id(frame) if frame else None,
+                source=source,
+                **kwargs,
             )
 
+    def spawn(self, coroutine):
+        task = asyncio.create_task(coroutine)
+        self.tasks.add(task)
+
+        def done(task):
+            self.tasks.discard(task)
+            if not task.cancelled() and task.exception():
+                self.emit(
+                    "warning",
+                    {
+                        "operation": "optional capture",
+                        "error": type(task.exception()).__name__,
+                    },
+                )
+
+        task.add_done_callback(done)
+        return task
+
+    def schedule_stop(self, reason):
+        if self.stopping or self.starting or self.finalizing_tasks:
+            return
+        task = asyncio.create_task(self.stop(reason))
+        self.finalizing_tasks.add(task)
+
+        def done(task):
+            self.finalizing_tasks.discard(task)
+            if not task.cancelled() and task.exception():
+                log.error("Finalization failed (%s)", type(task.exception()).__name__)
+
+        task.add_done_callback(done)
+
+    async def _autosave(self):
+        while self.recording:
+            await asyncio.sleep(self.config.flush_interval_ms / 1000)
+            await self.store.flush()
+
     async def start(self, url="about:blank", *, headless=False, executable_path=None):
-        if self.recording or self.stopping:
+        if self.recording or self.stopping or self.starting:
             raise RuntimeError("A session is already active")
+        self.starting = True
         self.pages, self.frames, self.requests, self.annotations = {}, {}, {}, []
         self.store = SessionStore(self.output, self.config)
-        self.emit("session.start", {}, source="recorder")
+        self.emit("session.start", {})
         try:
             self.playwright, self.browser, self.context = await browser_tools.launch(
-                headless=headless, executable_path=executable_path
+                self.config, headless=headless, executable_path=executable_path
             )
             self.browser.on(
-                "disconnected",
-                lambda: (
-                    self.schedule_stop("browser closed") if not self.stopping else None
-                ),
+                "disconnected", lambda: self.schedule_stop("browser closed")
             )
             self.context.on("page", self.attach_page)
-            self.context.on("request", self.on_request)
-            self.context.on("response", self.on_response)
-            self.context.on("requestfinished", self.on_finished)
-            self.context.on("requestfailed", self.on_failed)
+            # No network callbacks at all when the allowlist is empty.
+            if self.config.api_allowlist:
+                self.context.on("request", self.on_request)
+                self.context.on("requestfinished", self.on_finished)
+                self.context.on("requestfailed", self.on_failed)
             await self.context.expose_binding("__recorderEmit", self.on_sensor)
             await self.context.add_init_script(
                 script=browser_tools.sensor_script(self.config)
             )
+            self.autosave = asyncio.create_task(self._autosave())
+            self.autosave.add_done_callback(self._autosave_done)
             page = await self.context.new_page()
-            await page.goto(url)
+            # Analytics and streaming requests must not hold Start hostage.
+            try:
+                await page.goto(url, wait_until="domcontentloaded")
+            except PlaywrightTimeout:
+                self.emit(
+                    "warning",
+                    {
+                        "operation": "initial navigation timed out; browser remains usable"
+                    },
+                    page=page,
+                )
             return page
         except BaseException:
             await self.stop("startup failed")
             raise
+        finally:
+            self.starting = False
+
+    def _autosave_done(self, task):
+        if not task.cancelled() and task.exception():
+            log.error(
+                "Saving failed (%s); stopping capture", type(task.exception()).__name__
+            )
+            self.schedule_stop("storage failure")
 
     def attach_page(self, page):
-        self.emit("page.created", {"url": page.url}, page=page, frame=page.main_frame)
+        self.emit("page.open", {"url": page.url}, page=page, frame=page.main_frame)
         page.on("close", lambda: self.page_closed(page))
-        page.on("crash", lambda: self.emit("page.crashed", {}, page=page))
-        page.on(
-            "framenavigated",
-            lambda f: self.emit(
-                "navigation",
-                {"url": f.url, "name": f.name, "is_main_frame": f == page.main_frame},
-                page=page,
-                frame=f,
-            ),
-        )
-        page.on(
-            "frameattached",
-            lambda f: self.emit(
-                "frame.attached",
-                {
-                    "parent_frame_id": self.frame_id(f.parent_frame)
-                    if f.parent_frame
-                    else None
-                },
-                page=page,
-                frame=f,
-            ),
-        )
-        page.on(
-            "framedetached",
-            lambda f: self.emit("frame.detached", {}, page=page, frame=f),
-        )
-        page.on(
-            "popup",
-            lambda p: self.emit(
-                "page.popup", {"opener_page_id": self.page_id(page)}, page=p
-            ),
-        )
-        page.on(
-            "console",
-            lambda m: (
-                self.emit(
-                    "console.error", {"text": m.text, "location": m.location}, page=page
-                )
-                if m.type == "error"
-                else None
-            ),
-        )
-        page.on(
-            "pageerror",
-            lambda e: self.emit("page.error", {"message": str(e)}, page=page),
-        )
-        page.on("websocket", lambda ws: self.on_websocket(page, ws))
+        if self.config.record_errors:
+            page.on(
+                "pageerror",
+                lambda error: self.emit(
+                    "error", {"message": str(error)[:2000]}, page=page
+                ),
+            )
+        # HTML snapshots contain URL, title, frame, and state. No duplicate
+        # navigation, console, WebSocket, scroll, or mousemove event streams.
 
     def page_closed(self, page):
-        self.emit("page.closed", {}, page=page)
-        if not self.stopping and self.context and not self.context.pages:
+        self.emit("page.close", {}, page=page)
+        if self.context and not self.context.pages:
             self.schedule_stop("last page closed")
 
-    def on_websocket(self, page, ws):
-        ws_id = uuid4().hex
-        self.emit("websocket.open", {"id": ws_id, "url": ws.url}, page=page)
-        ws.on("close", lambda: self.emit("websocket.close", {"id": ws_id}, page=page))
-        ws.on(
-            "socketerror",
-            lambda e: self.emit(
-                "websocket.error", {"id": ws_id, "error": str(e)}, page=page
-            ),
+    def matches_api(self, request):
+        if (
+            request.resource_type not in {"fetch", "xhr"}
+            or request.method not in self.config.api_methods
+        ):
+            return False
+        parts = urlsplit(request.url)
+        match_url = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+        return any(
+            fnmatchcase(match_url, pattern) for pattern in self.config.api_allowlist
         )
 
-    def request_context(self, request):
-        try:
-            return {"frame": request.frame, "page": request.frame.page}
-        except Error:
-            return {}  # Service-worker requests do not have a frame.
-
-    def request_id(self, request):
-        if request not in self.requests:
-            self.requests[request] = f"request-{len(self.requests) + 1}"
-        return self.requests[request]
-
-    def body_payload(self, body: bytes, content_type: str):
+    def body_payload(self, body, content_type):
         if len(body) > self.config.max_body_bytes:
-            return {"body_omitted": "size limit", "body_bytes": len(body)}
-        if "json" in content_type:
-            try:
+            return {"omitted": "size limit", "bytes": len(body)}
+        try:
+            if "json" in content_type:
                 value = json.loads(body)
-            except (ValueError, UnicodeError):
-                return {"body_omitted": "invalid JSON"}
-        elif "x-www-form-urlencoded" in content_type:
-            value = dict(
-                parse_qsl(
-                    body.decode("utf-8", errors="replace"), keep_blank_values=True
-                )
-            )
-        elif content_type.startswith("text/plain"):
-            value = body.decode("utf-8", errors="replace")
-        else:
-            return {"body_omitted": "resource type"}
-        if len(body) > self.config.inline_body_bytes:
-            return {
-                "body_artifact": self.store.artifact("network", {"body": value}),
-                "body_bytes": len(body),
-            }
-        return {"body": value, "body_bytes": len(body)}
+            elif "x-www-form-urlencoded" in content_type:
+                value = dict(parse_qsl(body.decode("utf-8"), keep_blank_values=True))
+            elif content_type.startswith("text/plain"):
+                value = body.decode("utf-8")
+            else:
+                return {"omitted": "content type"}
+            return {"data": value}
+        except (ValueError, UnicodeError):
+            return {"omitted": "invalid text or JSON"}
 
     def on_request(self, request):
+        if not self.recording or not self.matches_api(request):
+            return
+        if len(self.requests) + len(self.tasks) >= self.config.max_pending_apis:
+            self.store.dropped_apis += 1
+            return
         payload = {
-            "request_id": self.request_id(request),
             "url": request.url,
             "method": request.method,
-            "resource_type": request.resource_type,
-            "headers": request.headers,
+            "started_elapsed_ms": round(
+                (time.monotonic() - self.store.started) * 1000, 1
+            ),
         }
-        if request.redirected_from:
-            payload["redirected_from"] = self.request_id(request.redirected_from)
-            self.emit(
-                "network.redirect",
-                {
-                    "from_request_id": payload["redirected_from"],
-                    "to_request_id": payload["request_id"],
-                    "url": request.url,
-                },
-                **self.request_context(request),
-            )
-        if request.post_data_buffer:
-            payload.update(
-                self.body_payload(
-                    request.post_data_buffer, request.headers.get("content-type", "")
+        if self.config.capture_headers:
+            payload["request_headers"] = request.headers
+        if self.config.max_body_bytes and request.method not in {"GET", "HEAD"}:
+            headers = request.headers
+            length = headers.get("content-length", "")
+            kind = headers.get("content-type", "")
+            if (
+                length.isdigit()
+                and int(length) <= self.config.max_body_bytes
+                and (
+                    "json" in kind
+                    or "x-www-form-urlencoded" in kind
+                    or kind.startswith("text/plain")
                 )
-            )
-        self.emit("network.request", payload, **self.request_context(request))
-
-    def on_response(self, response):
-        self.emit(
-            "network.response",
-            {
-                "request_id": self.request_id(response.request),
-                "url": response.url,
-                "status": response.status,
-                "headers": response.headers,
-            },
-            **self.request_context(response.request),
-        )
-
-    def on_failed(self, request):
-        self.emit(
-            "network.failed",
-            {
-                "request_id": self.request_id(request),
-                "failure": request.failure,
-                "timing": request.timing,
-            },
-            **self.request_context(request),
-        )
+            ):
+                body = request.post_data_buffer
+                if body is not None:
+                    payload["request_body"] = self.body_payload(body, kind)
+            else:
+                payload["request_body"] = {
+                    "omitted": "unknown/oversized length or content type"
+                }
+        try:
+            frame = request.frame
+        except Error:
+            frame = None
+        self.requests[request] = (payload, frame, self.store.annotation_id)
 
     def on_finished(self, request):
-        self.emit(
-            "network.finished",
-            {"request_id": self.request_id(request), "timing": request.timing},
-            **self.request_context(request),
-        )
-        self.spawn(self.capture_body(request))
+        info = self.requests.pop(request, None)
+        if info:
+            self.spawn(self.capture_api(request, info))
 
-    async def capture_body(self, request):
-        response = await request.response()
-        if response is None or request.resource_type not in {"fetch", "xhr"}:
-            return
-        content_type = response.headers.get("content-type", "").lower()
-        if not ("json" in content_type or content_type.startswith("text/plain")):
-            return
-        # Only bounded bodies are retrieved; unknown/chunked bodies stay metadata-only.
-        size = response.headers.get("content-length", "")
-        if not size.isdigit() or int(size) > self.config.max_body_bytes:
-            self.emit(
-                "network.body",
-                {
-                    "request_id": self.request_id(request),
-                    "body_omitted": "unknown or oversized length",
-                },
-                **self.request_context(request),
-            )
-            return
-        try:
-            payload = self.body_payload(await response.body(), content_type)
-        except Error:
-            payload = {"body_omitted": "read failed"}
+    def on_failed(self, request):
+        info = self.requests.pop(request, None)
+        if info:
+            payload, frame, annotation = info
+            payload["failure"] = request.failure
+            self.emit_api(payload, frame, annotation)
+
+    def emit_api(self, payload, frame, annotation):
         self.emit(
-            "network.body",
-            {"request_id": self.request_id(request), **payload},
-            **self.request_context(request),
+            "api",
+            payload,
+            frame=frame,
+            page=frame.page if frame else None,
+            source="playwright",
+            annotation_id=annotation,
         )
+
+    async def capture_api(self, request, info):
+        payload, frame, annotation = info
+        try:
+            async with asyncio.timeout(self.config.api_timeout_ms / 1000):
+                response = await request.response()
+                if response:
+                    payload["status"] = response.status
+                    payload["duration_ms"] = request.timing.get("responseEnd", -1)
+                    headers = response.headers
+                    if self.config.capture_headers:
+                        payload["response_headers"] = headers
+                    kind = headers.get("content-type", "")
+                    length = headers.get("content-length", "")
+                    if (
+                        self.config.max_body_bytes
+                        and length.isdigit()
+                        and int(length) <= self.config.max_body_bytes
+                        and ("json" in kind or kind.startswith("text/plain"))
+                    ):
+                        payload["response_body"] = self.body_payload(
+                            await response.body(), kind
+                        )
+                    else:
+                        payload["response_body"] = {
+                            "omitted": "unknown/oversized length or content type"
+                        }
+        except (Error, TimeoutError):
+            payload["response_body"] = {"omitted": "read failed or timed out"}
+        self.emit_api(payload, frame, annotation)
 
     def on_sensor(self, source, data):
-        if not self.recording:
+        if not self.recording and not self.stopping:
             return
         try:
-            if not isinstance(data, dict) or data.get("type") not in {
-                "dom",
-                "action.click",
-                "action.input",
-                "action.change",
-                "action.submit",
-                "sensor.error",
-                "location",
-            }:
-                raise ValueError("Invalid sensor event")
-            payload = data.get("payload")
-            if not isinstance(payload, dict):
-                raise TypeError("Invalid sensor payload")
-            if data["type"].startswith("action."):
-                payload = ActionPayload.model_validate(payload).model_dump(
-                    exclude_none=True
+            if data["type"] == "warning":
+                self.emit(
+                    "warning",
+                    {
+                        "operation": "HTML sensor",
+                        "message": str(data["payload"]["message"])[:200],
+                    },
+                    page=source["page"],
                 )
-            if data["type"] == "dom":
-                mutation = payload.get("data")
-                if not isinstance(payload.get("type"), int) or not isinstance(
-                    mutation, dict
-                ):
-                    raise TypeError("Invalid rrweb event")
-                for key in ("adds", "removes", "texts", "attributes"):
-                    entries = mutation.get(key, [])
-                    if not isinstance(entries, list) or not all(
-                        isinstance(e, dict) for e in entries
-                    ):
-                        raise TypeError("Invalid rrweb mutation")
-                summary = {
-                    "rrweb_type": payload.get("type"),
-                    "source": payload.get("data", {}).get("source"),
-                }
-                summary["changes"] = {
-                    k: len(mutation.get(k, []))
-                    for k in ("adds", "removes", "texts", "attributes")
-                }
-                summary["artifact"] = self.store.artifact("dom", payload)
-                payload = summary
-            self.emit(
-                data["type"],
-                payload,
-                page=source["page"],
-                frame=source["frame"],
-                source="rrweb" if data["type"] == "dom" else "sensor",
+                return
+            payload = data["payload"]
+            if (
+                data["type"] != "html"
+                or not isinstance(payload, dict)
+                or not isinstance(payload.get("html"), str)
+            ):
+                raise ValueError("Invalid HTML snapshot")
+            if (
+                len(payload["html"]) > self.config.max_html_chars
+                or not isinstance(payload.get("actions", []), list)
+                or len(payload.get("actions", [])) > 20
+            ):
+                raise ValueError("Oversized snapshot")
+            frame = source["frame"]
+            payload["parent_frame_id"] = (
+                self.frame_id(frame.parent_frame) if frame.parent_frame else None
             )
-        except (TypeError, ValueError, KeyError, AttributeError):
-            self.emit(
-                "recorder.warning",
-                {"operation": "malformed sensor event skipped"},
-                source="recorder",
-            )
+            self.emit("html", payload, page=source["page"], frame=frame, source="dom")
+        except (KeyError, ValueError, TypeError):
+            self.emit("warning", {"operation": "invalid HTML sensor event skipped"})
 
-    def save_annotations(self):
-        self.store.write_json(
-            "annotations.json", [a.model_dump() for a in self.annotations]
-        )
+    async def flush_html(self):
+        for page in list(self.context.pages) if self.context else []:
+            frames = page.frames if self.config.capture_frames else [page.main_frame]
+            for frame in frames:
+                try:
+                    await asyncio.wait_for(
+                        frame.evaluate("() => window.__recorderFlush?.()"), timeout=2
+                    )
+                except (Error, TimeoutError):
+                    self.emit(
+                        "warning",
+                        {"operation": "HTML flush unavailable"},
+                        page=page,
+                        frame=frame,
+                    )
 
     def start_annotation(self, name, *, goal=None, expected_result=None, tags=None):
         if not self.recording:
@@ -392,60 +355,26 @@ class Recorder:
         )
         self.store.annotation_id = annotation.id
         self.annotations.append(annotation)
-        self.emit("annotation.start", annotation.model_dump(), source="gui")
-        self.save_annotations()
+        self.store.annotations.append(annotation.model_dump())
+        self.emit("annotation.start", annotation.model_dump())
         return annotation
 
-    async def observed_state(self):
-        for page in list(self.context.pages) if self.context else []:
-            if page.is_closed():
-                continue
-            try:
-                state = await page.evaluate(
-                    "() => window.__recorderState ? window.__recorderState() : {url: location.href, title: document.title}"
-                )
-                self.emit(
-                    "page.state",
-                    state,
-                    page=page,
-                    frame=page.main_frame,
-                    source="sensor",
-                )
-            except Error:
-                self.emit(
-                    "recorder.warning",
-                    {"operation": "page state unavailable"},
-                    page=page,
-                    source="recorder",
-                )
-
     async def end_annotation(self):
-        if not self.store or not self.store.annotation_id:
-            return
-        await self.observed_state()
-        annotation = self.annotations[-1]
-        event = self.emit("annotation.end", {"id": annotation.id}, source="gui")
-        annotation.end_seq = event.seq
-        self.save_annotations()
-        self.store.annotation_id = None
+        if self.store and self.store.annotation_id:
+            await self.flush_html()
+            # Reserve room for the boundary even after a burst.
+            await self.store.flush()
+            event = self.emit("annotation.end", {"id": self.store.annotation_id})
+            self.annotations[-1].end_seq = event.seq if event else self.store.seq
+            self.store.annotations[-1] = self.annotations[-1].model_dump()
+            self.store.annotation_id = None
 
     async def checkpoint(self):
         if not self.recording:
             raise RuntimeError("Start a session first")
-        self.emit("checkpoint", {}, source="gui")
-        await self.observed_state()
-        for page in list(self.context.pages):
-            for frame in page.frames:
-                try:
-                    await frame.evaluate("() => window.__recorderSnapshot?.()")
-                except Error:
-                    self.emit(
-                        "recorder.warning",
-                        {"operation": "checkpoint snapshot unavailable"},
-                        page=page,
-                        frame=frame,
-                        source="recorder",
-                    )
+        await self.flush_html()
+        await self.store.flush()
+        self.emit("checkpoint", {})
 
     async def stop(self, reason="user stopped"):
         async with self._stop_lock:
@@ -453,31 +382,46 @@ class Recorder:
                 return
             self.stopping = True
             try:
-                await self.end_annotation()
-                await self.observed_state()
+                if self.store.annotation_id:
+                    await self.end_annotation()
+                else:
+                    await self.flush_html()
                 if self.context:
-                    try:
-                        await self.context.close()
-                    except Error:
-                        pass
-                pending = [t for t in self.tasks if t is not asyncio.current_task()]
-                if pending:
-                    _, unfinished = await asyncio.wait(pending, timeout=5)
-                    for task in unfinished:
+                    await self.context.close()
+                # Never wait indefinitely on streaming API requests.
+                for request, (payload, frame, annotation) in list(
+                    self.requests.items()
+                ):
+                    payload["failure"] = "session ended before request completed"
+                    self.emit_api(payload, frame, annotation)
+                self.requests.clear()
+                if self.tasks:
+                    _, pending = await asyncio.wait(
+                        self.tasks, timeout=self.config.api_timeout_ms / 1000 + 0.2
+                    )
+                    for task in pending:
                         task.cancel()
-                    await asyncio.gather(*unfinished, return_exceptions=True)
-                if self.browser:
-                    await self.browser.close()
+                    await asyncio.gather(*pending, return_exceptions=True)
+            except Error:
+                pass  # Browser may have already disconnected.
             finally:
                 try:
-                    if self.playwright:
-                        await self.playwright.stop()
+                    if self.autosave:
+                        self.autosave.cancel()
+                        await asyncio.gather(self.autosave, return_exceptions=True)
+                    for task in self.tasks:
+                        task.cancel()
+                    if self.tasks:
+                        await asyncio.gather(*self.tasks, return_exceptions=True)
+                    try:
+                        if self.browser:
+                            await self.browser.close()
+                    finally:
+                        if self.playwright:
+                            await self.playwright.stop()
                 finally:
                     self.playwright = self.browser = self.context = None
                     try:
-                        self.store.finish(reason)
-                        from .context_export import export_context
-
-                        export_context(self.store.path)
+                        await self.store.finish(reason)
                     finally:
                         self.stopping = False
