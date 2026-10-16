@@ -52,6 +52,7 @@ class Config(BaseModel):
     flush_interval_ms: int = Field(default=1000, ge=100, le=30_000)
     max_pending_events: int = Field(default=100, ge=10, le=1000)
     device: str | None = None
+    fixed_viewport: bool = False
     viewport_width: int = Field(default=1280, ge=320, le=3840)
     viewport_height: int = Field(default=800, ge=320, le=3840)
     navigation_timeout_ms: int = Field(default=30_000, ge=1000, le=120_000)

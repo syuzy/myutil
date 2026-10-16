@@ -16,6 +16,10 @@ async def launch(config: Config, *, headless=False, executable_path=None):
             if not options.get("is_mobile"):
                 raise ValueError("Use a mobile profile or --desktop")
             options.pop("default_browser_type", None)
+        elif not headless and not config.fixed_viewport:
+            # Native sizing accounts for browser chrome and follows window
+            # resizing, instead of forcing content beyond the monitor edge.
+            options = {"no_viewport": True}
         else:
             options = {
                 "viewport": {
