@@ -79,7 +79,7 @@ uv run browser-ui-recorder --list-devices
 uv run browser-ui-recorder --desktop --url https://example.com
 ```
 
-The browser engine remains Chromium for every profile, including iPhone profiles. This checks responsive/touch behavior, not Safari compatibility. The JSON records the selected device so an LLM can reproduce the emulation. Desktop follows the actual browser window content area, so resizing or maximizing the window keeps the bottom visible. Set `fixed_viewport: true` to force configured desktop dimensions. Headless runs use configured dimensions for repeatability; named devices retain their emulation profile dimensions.
+The browser engine remains Chromium for every profile, including iPhone profiles. This checks responsive/touch behavior, not Safari compatibility. The JSON records the selected device so an LLM can reproduce the emulation. Desktop uses the configurable viewport; named devices use their own profile dimensions. In a visible mobile session, the phone display is automatically scaled to fit the monitor’s available area, allowing for the browser toolbar and OS decorations. This display scale preserves the phone’s logical viewport, device pixel ratio, touch behavior, and user agent. Headless mobile runs retain the original profile without display fitting. Tabs in the same window share its fitted scale; restart the session after moving to a differently sized monitor.
 
 ## 5. Optional small control window
 
@@ -151,9 +151,8 @@ At most 20 user actions accompany a batch; overflow is counted in `dropped_actio
 | `flush_interval_ms` | `1000` | Batch disk writes at this interval (100–30000). Writes run outside the browser/UI event loop. |
 | `max_pending_events` | `100` | Bounded in-memory event buffer (10–1000). Overflow increments `dropped_events`; recording does not accumulate an unbounded backlog. |
 | `device` | `null` | Desktop, or a named Playwright mobile profile. |
-| `fixed_viewport` | `false` | Force desktop viewport dimensions in a visible browser. Default desktop sizing follows the window and accounts for browser chrome. Headless and named mobile profiles retain fixed sizing. |
-| `viewport_width` | `1280` | Desktop width when fixed/headless sizing is used (320–3840). |
-| `viewport_height` | `800` | Desktop height when fixed/headless sizing is used (320–3840). |
+| `viewport_width` | `1280` | Desktop viewport width (320–3840). |
+| `viewport_height` | `800` | Desktop viewport height (320–3840). |
 | `navigation_timeout_ms` | `30000` | Startup navigation timeout (1000–120000). A timeout warns but leaves Chromium usable. Startup waits for DOMContentLoaded, not every resource or network idle. |
 
 Passwords, payment fields, secret key names, auth/cookie headers, sensitive URL parameters, recognizable token/card strings, and configured selectors are masked before disk writes. HTML omits scripts, event handlers, arbitrary data attributes, and resource bodies. Redaction remains heuristic for secrets in unlabelled prose; use synthetic test accounts and add selectors for app-specific sensitive regions. Session files are created with private owner permissions.

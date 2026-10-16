@@ -123,6 +123,7 @@ class Recorder:
             self.autosave = asyncio.create_task(self._autosave())
             self.autosave.add_done_callback(self._autosave_done)
             page = await self.context.new_page()
+            await browser_tools.prepare_page(page)
             # Analytics and streaming requests must not hold Start hostage.
             try:
                 await page.goto(url, wait_until="domcontentloaded")
